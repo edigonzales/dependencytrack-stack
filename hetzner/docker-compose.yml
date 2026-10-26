@@ -1,0 +1,121 @@
+name: ${COMPOSE_PROJECT_NAME:-dependencytrack}
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:18-alpine}
+    restart: unless-stopped
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-768m}
+    logging: *logging
+    environment:
+      POSTGRES_DB: dtrack
+      POSTGRES_USER: dtrack
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: ${TZ:-Europe/Zurich}
+    secrets:
+      - postgres_password
+    command:
+      - postgres
+      - -c
+      - max_connections=30
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - jit=off
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    volumes:
+      # Ab PostgreSQL 18 liegt PGDATA unter /var/lib/postgresql/18/docker.
+      - postgres-data:/var/lib/postgresql
+
+  apiserver:
+    image: ghcr.io/dependencytrack/apiserver:${DTRACK_VERSION:-5.2.1}
+    restart: unless-stopped
+    mem_limit: ${API_MEMORY_LIMIT:-2g}
+    logging: *logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DT_DATASOURCE_URL: jdbc:postgresql://postgres:5432/dtrack
+      DT_DATASOURCE_USERNAME: dtrack
+      # $$ schützt die MicroProfile-Dateireferenz vor Compose-Interpolation.
+      DT_DATASOURCE_PASSWORD: '$${file::/run/secrets/postgres_password}'
+      DT_DATASOURCE_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      DT_DATASOURCE_POOL_MIN_IDLE: ${DB_POOL_MIN_IDLE:-2}
+      DT_CORS_ENABLED: "false"
+      TZ: ${TZ:-Europe/Zurich}
+    secrets:
+      - postgres_password
+    healthcheck:
+      # Management allein kann bereits vor dem HTTP-API-Start antworten.
+      test: [CMD-SHELL, "wget -q -Y off -T 3 -O /dev/null http://127.0.0.1:9000/health && wget -q -Y off -T 3 -O /dev/null http://127.0.0.1:8080/api/version"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 120s
+    stop_grace_period: 90s
+    volumes:
+      # Enthält .dependency-track/keys/secret-management-kek.json: sichern.
+      - apiserver-data:/data
+
+  frontend:
+    image: ghcr.io/dependencytrack/frontend:${DTRACK_VERSION:-5.2.1}
+    restart: unless-stopped
+    mem_limit: ${FRONTEND_MEMORY_LIMIT:-128m}
+    logging: *logging
+    environment:
+      API_BASE_URL: https://${DTRACK_DOMAIN:?DTRACK_DOMAIN in .env setzen}
+    healthcheck:
+      test: [CMD, wget, -q, -T, "3", -O, /dev/null, "http://127.0.0.1:8080/"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+    depends_on:
+      apiserver:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:${CADDY_VERSION:-2.11.7}-alpine
+    restart: unless-stopped
+    mem_limit: ${CADDY_MEMORY_LIMIT:-128m}
+    logging: *logging
+    environment:
+      DTRACK_DOMAIN: ${DTRACK_DOMAIN:?DTRACK_DOMAIN in .env setzen}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL in .env setzen}
+      ACME_CA: ${ACME_CA:-https://acme-v02.api.letsencrypt.org/directory}
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      frontend:
+        condition: service_healthy
+      apiserver:
+        condition: service_healthy
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+
+volumes:
+  postgres-data:
+  apiserver-data:
+  caddy-data:
+  caddy-config:

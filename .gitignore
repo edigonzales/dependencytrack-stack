@@ -1,1 +1,8 @@
 .DS_Store
+.env
+.env.*
+!.env.example
+**/secrets/
+**/backups/
+__pycache__/
+**/restore.local.yml
